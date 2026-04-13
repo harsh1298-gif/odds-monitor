@@ -141,6 +141,8 @@ with st.sidebar:
     show_pending = st.checkbox("Include pending", True)
 
 cutoff = datetime.utcnow() - timedelta(days=days_back)
+cutoff = pd.Timestamp(cutoff).tz_localize(None)
+df["spotted_at"] = df["spotted_at"].dt.tz_localize(None)
 fdf = df[df["spotted_at"] >= cutoff]
 if sel_league != "All":
     fdf = fdf[fdf["league"] == sel_league]
