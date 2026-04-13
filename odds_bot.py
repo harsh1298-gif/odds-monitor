@@ -14,7 +14,6 @@ import requests
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from supabase import create_client, Client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,8 +51,11 @@ LEAGUES = [
 #   SUPABASE CLIENT
 # ============================================================
 
-def get_db() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+def get_db():
+    return {
+        "url": SUPABASE_URL,
+        "key": SUPABASE_KEY,
+    }
 
 # ============================================================
 #   ODDS FETCHING
@@ -121,36 +123,55 @@ def parse_best_odds(match: dict, league: str) -> dict | None:
 #   DATABASE LOGGING
 # ============================================================
 
-def log_to_db(db: Client, records: list):
+def log_to_db(db: dict, records: list):
     if not records:
         return
     try:
-        db.table("scans").upsert(records, on_conflict="match_id,scanned_at").execute()
+        headers = {
+            "apikey": db["key"],
+            "Authorization": f"Bearer {db['key']}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+        }
+        r = requests.post(
+            f"{db['url']}/rest/v1/scans",
+            headers=headers,
+            json=records,
+            timeout=15,
+        )
         log.info(f"  Logged {len(records)} records to Supabase")
     except Exception as e:
         log.error(f"  DB write failed: {e}")
 
 
-def log_opportunity(db: Client, match: dict):
+def log_opportunity(db: dict, match: dict):
     profit_home = round(STAKE_PER_SIDE * match["home_odds"] - STAKE_PER_SIDE * 2)
     profit_away = round(STAKE_PER_SIDE * match["away_odds"] - STAKE_PER_SIDE * 2)
     try:
-        db.table("opportunities").insert({
-            "match_id":      match["match_id"],
-            "home_team":     match["home_team"],
-            "away_team":     match["away_team"],
-            "league":        match["league"],
-            "commence_time": match["commence_time"],
-            "home_odds":     match["home_odds"],
-            "away_odds":     match["away_odds"],
-            "draw_odds":     match["draw_odds"],
-            "profit_if_home_wins": profit_home,
-            "profit_if_away_wins": profit_away,
-            "loss_if_draw":        -(STAKE_PER_SIDE * 2),
-            "spotted_at":    match["scanned_at"],
-            "result":        None,   # filled later when match resolves
-            "actual_profit": None,
-        }).execute()
+        headers = {
+            "apikey": db["key"],
+            "Authorization": f"Bearer {db['key']}",
+            "Content-Type": "application/json",
+        }
+        requests.post(
+            f"{db['url']}/rest/v1/opportunities",
+            headers=headers,
+            json={
+                "match_id":      match["match_id"],
+                "home_team":     match["home_team"],
+                "away_team":     match["away_team"],
+                "league":        match["league"],
+                "commence_time": match["commence_time"],
+                "home_odds":     match["home_odds"],
+                "away_odds":     match["away_odds"],
+                "draw_odds":     match["draw_odds"],
+                "profit_if_home_wins": profit_home,
+                "profit_if_away_wins": profit_away,
+                "loss_if_draw":        -(STAKE_PER_SIDE * 2),
+                "spotted_at":    match["scanned_at"],
+            },
+            timeout=15,
+        )
     except Exception as e:
         log.error(f"  Opportunity log failed: {e}")
 
