@@ -378,19 +378,19 @@ with tab2:
 
     col_filter1, col_filter2 = st.columns(2)
     with col_filter1:
-        sort_by = st.selectbox("Sort by", ["Most recent","Highest home odds","Highest away odds","Highest EV"])
+        sort_by = st.selectbox("Sort by", ["Most recent","Highest home odds","Highest away odds","Highest EV"], key="tab2_sort_by")
     with col_filter2:
-        result_filter = st.selectbox("Filter by result", ["All","Pending","Won","Lost to draw"])
+        result_filter = st.selectbox("Filter by result", ["All","Pending","Won","Lost to draw"], key="tab2_result_filter")
 
     dff = fdf.copy()
-    if result_filter == "Pending":   dff = dff[dff["pending"]]
-    elif result_filter == "Won":     dff = dff[dff["won"]]
+    if result_filter == "Pending":        dff = dff[dff["pending"]]
+    elif result_filter == "Won":          dff = dff[dff["won"]]
     elif result_filter == "Lost to draw": dff = dff[dff["lost"]]
 
-    if sort_by == "Highest home odds": dff = dff.sort_values("home_odds", ascending=False)
+    if sort_by == "Highest home odds":   dff = dff.sort_values("home_odds", ascending=False)
     elif sort_by == "Highest away odds": dff = dff.sort_values("away_odds", ascending=False)
-    elif sort_by == "Highest EV": dff = dff.sort_values("ev_score", ascending=False)
-    else: dff = dff.sort_values("spotted_at", ascending=False)
+    elif sort_by == "Highest EV":        dff = dff.sort_values("ev_score", ascending=False)
+    else:                                dff = dff.sort_values("spotted_at", ascending=False)
 
     st.markdown(f"Showing **{len(dff)}** opportunities")
 
@@ -528,7 +528,7 @@ with tab4:
 
     st.divider()
     st.markdown("#### bookmaker odds comparison tips")
-    
+
     tips = [
         ("🏆 Bet365", "Best for Champions League and Premier League. Usually offers competitive odds 48hrs before kickoff."),
         ("⚡ 1xBet", "Highest odds overall, especially for La Liga and Bundesliga. Check for early odds releases."),
@@ -548,21 +548,24 @@ with tab5:
     st.markdown("#### update match results")
     st.markdown("*After a match ends, update the result here to track your accuracy and P&L*")
 
-    pending_df = fdf[fdf["pending"]].sort_values("commence_time")
+    pending_df = fdf[fdf["pending"]].sort_values("commence_time").drop_duplicates(subset="match_id")
 
     if pending_df.empty:
         st.success("No pending matches to update!")
     else:
         st.markdown(f"**{len(pending_df)} matches** waiting for results")
 
-        for _, row in pending_df.head(20).iterrows():
+        for idx, (_, row) in enumerate(pending_df.head(20).iterrows()):
             with st.expander(f"{row['home_team']} vs {row['away_team']} — {row['league_name']} · {row['spotted_at'].strftime('%b %d')}"):
                 c1, c2 = st.columns([2, 1])
+
                 with c1:
-                    # In Tab 5, before the for loop
-                        pending_df = fdf[fdf["pending"]].sort_values("commence_time")
-                        pending_df = pending_df.drop_duplicates(subset="match_id")  # ← add this
-                    
+                    result = st.selectbox(
+                        "Result",
+                        ["Select result...", "home_win", "away_win", "draw"],
+                        key=f"result_{row['match_id']}_{idx}",
+                    )
+
                 with c2:
                     if result == "home_win":
                         profit = round(stake * row["home_odds"] - stake * 2)
@@ -572,11 +575,13 @@ with tab5:
                         st.metric("Actual profit", f"+${profit:,}")
                     elif result == "draw":
                         st.metric("Actual loss", f"-${stake*2:,}")
-                        if selected_result == "home_win":   ap = round(5000 * row["home_odds"] - 10000)
-                        elif selected_result == "away_win": ap = round(5000 * row["away_odds"] - 10000)
-                        else:                               ap = -10000
 
-                    if st.button(f"Save result", key=f"save_{row['match_id']}"):
+                if result != "Select result...":
+                    if result == "home_win":   ap = round(5000 * row["home_odds"] - 10000)
+                    elif result == "away_win": ap = round(5000 * row["away_odds"] - 10000)
+                    else:                      ap = -10000
+
+                    if st.button("Save result", key=f"save_{row['match_id']}_{idx}"):
                         success = supabase_patch("opportunities", row["match_id"], {
                             "result": result,
                             "actual_profit": ap,
@@ -602,8 +607,8 @@ with tab6:
 
     if not resolved.empty:
         r3 = resolved.sort_values("spotted_at").copy()
-        r3["sim_profit"]    = r3["actual_profit"] * (stake / 5000)
-        r3["cumulative_pl"] = r3["sim_profit"].cumsum()
+        r3["sim_profit"]       = r3["actual_profit"] * (stake / 5000)
+        r3["cumulative_pl"]    = r3["sim_profit"].cumsum()
         r3["running_win_rate"] = r3["won"].expanding().mean() * 100
 
         fig_pl = go.Figure()
