@@ -15,6 +15,10 @@
   9.  st.secrets crash without secrets.toml → try/except around st.secrets access
   10. Expander key collisions + iterrows  → use enumerate; keys include loop index
   11. Bare except + mutable default arg   → specific Exception catches; no mutable defaults
+
+  FEATURE ADDED:
+  12. Opportunity expiration              → opportunities vanish after commence_time passes
+  13. Safe timestamp formatting           → handle NaT in expander labels
 ============================================================
 """
 
@@ -127,9 +131,10 @@ div[data-testid="stMetricDelta"] svg { display: none; }
   transition: border-color 0.2s;
 }
 .opp-card:hover { border-color: var(--border2); }
-.opp-card-placed { border-color: var(--green) !important; box-shadow: var(--card-glow); }
-.opp-card-won    { border-color: var(--green2) !important; }
-.opp-card-lost   { border-color: var(--red) !important; }
+.opp-card-placed  { border-color: var(--green) !important; box-shadow: var(--card-glow); }
+.opp-card-won     { border-color: var(--green2) !important; }
+.opp-card-lost    { border-color: var(--red) !important; }
+.opp-card-expired { border-color: var(--red) !important; opacity: 0.7; }
 
 .badge {
   display: inline-block;
@@ -193,7 +198,6 @@ BLUE   = "#4488ff"
 MUTED  = "#1a2233"
 
 # ── CONFIG ───────────────────────────────────────────────────
-# FIX 9: st.secrets crash without secrets.toml — wrapped in try/except
 def _secret(key: str, fallback: str = "") -> str:
     try:
         return st.secrets.get(key, fallback)
@@ -221,10 +225,18 @@ BOOKMAKERS = {
     "soccer_france_ligue_one":   ["Bet365", "PMU", "1xBet", "Unibet", "Bwin"],
 }
 
+# ── HELPER: Safe timestamp formatting ──────────────────────
+def safe_strftime(dt, fmt: str = "%b %d %H:%M") -> str:
+    """Return formatted datetime string, or 'Unknown' if NaT/None."""
+    if pd.isna(dt) or dt is None:
+        return "Unknown"
+    try:
+        return dt.strftime(fmt)
+    except AttributeError:
+        return "Unknown"
+
 # ── SUPABASE ─────────────────────────────────────────────────
-# FIX 11: Specific Exception instead of bare except
 def sb_get(table: str, params: dict | None = None) -> list:
-    """FIX 11: No mutable default arg; None sentinel used instead."""
     if params is None:
         params = {}
     h = {
@@ -240,7 +252,6 @@ def sb_get(table: str, params: dict | None = None) -> list:
     except Exception as exc:
         st.warning(f"DB read error: {exc}")
         return []
-
 
 def sb_patch(table: str, match_id: str, data: dict) -> bool:
     h = {
@@ -259,14 +270,9 @@ def sb_patch(table: str, match_id: str, data: dict) -> bool:
         st.warning(f"DB write error: {exc}")
         return False
 
-
-# FIX 5: Timezone-aware tz_localize TypeError
-# Use utc=True in pd.to_datetime so tz-aware strings parse correctly,
-# then convert to UTC-naive via dt.tz_convert(None) instead of tz_localize(None).
 def _to_naive_utc(series: pd.Series) -> pd.Series:
     parsed = pd.to_datetime(series, errors="coerce", utc=True)
     return parsed.dt.tz_convert(None)
-
 
 @st.cache_data(ttl=180)
 def load_data() -> pd.DataFrame:
@@ -275,7 +281,6 @@ def load_data() -> pd.DataFrame:
     if df.empty:
         return df
 
-    # FIX 5 applied here
     df["spotted_at"]    = _to_naive_utc(df["spotted_at"])
     df["commence_time"] = _to_naive_utc(df["commence_time"])
 
@@ -289,14 +294,16 @@ def load_data() -> pd.DataFrame:
     df["avg_odds"]      = ((df["home_odds"] + df["away_odds"]) / 2).round(2)
     df["ev_score"]      = (df["avg_odds"] - 2.0).round(3)
 
-    # Original fix (preserved): df.get() returns scalar — use column check instead
     if "bet_placed" in df.columns:
         df["bet_placed"] = df["bet_placed"].fillna(False)
     else:
         df["bet_placed"] = False
 
-    return df
+    now_utc = pd.Timestamp(datetime.utcnow())
+    df["expired"] = df["commence_time"] < now_utc
+    df["active"]  = ~df["expired"] & df["pending"]
 
+    return df
 
 def demo_data() -> pd.DataFrame:
     np.random.seed(99)
@@ -325,6 +332,7 @@ def demo_data() -> pd.DataFrame:
             days=int(np.random.uniform(0, 30)),
             hours=int(np.random.uniform(0, 24)),
         )
+        commence = spot + timedelta(days=int(np.random.uniform(1, 5)))
         placed = np.random.random() < 0.3
         data.append({
             "match_id":            f"match_{i}",
@@ -341,7 +349,7 @@ def demo_data() -> pd.DataFrame:
             "profit_if_away_wins": round(5000 * ao - 10000),
             "loss_if_draw":        -10000,
             "spotted_at":          spot,
-            "commence_time":       spot + timedelta(days=2),
+            "commence_time":       commence,
             "result":              res,
             "actual_profit":       ap,
             "date":                spot.date(),
@@ -355,30 +363,39 @@ def demo_data() -> pd.DataFrame:
             "bet_placed":          placed,
             "notes":               "",
         })
-    return pd.DataFrame(data)
 
+    df = pd.DataFrame(data)
+    now_utc = pd.Timestamp(now)
+    df["expired"] = df["commence_time"] < now_utc
+    df["active"]  = ~df["expired"] & df["pending"]
+    return df
 
-# ── HELPER: safe row field access for pandas Series ──────────
-# FIX 7: Unsafe row.get() on pandas Series — use _row_get() wrapper
 def _row_get(row: pd.Series, key: str, default=None):
-    """Safe field access that works for both dict and pd.Series."""
     try:
         val = row[key]
         return default if pd.isna(val) else val
     except (KeyError, TypeError, ValueError):
         return default
 
-
 # ══════════════════════════════════════════════════════════
 #   SIDEBAR
 # ══════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown('<div class="section-title">⚙ Filters</div>', unsafe_allow_html=True)
-    days_back = st.slider("Days", 1, 90, 30)          # key="days_back" implicit — unique
+    days_back = st.slider("Days", 1, 90, 30)
     all_leagues = list(LEAGUE_NAMES.values())
     sel_leagues = st.multiselect("Leagues", all_leagues, default=all_leagues)
     min_odds_filter = st.slider("Min avg odds", 2.0, 4.0, 2.0, 0.05)
-    status_filter = st.selectbox("Status", ["All", "Pending", "Won", "Lost", "Bet Placed"])
+
+    status_filter = st.selectbox(
+        "Status",
+        ["Active", "All", "Pending", "Won", "Lost", "Expired", "Bet Placed"],
+    )
+    show_expired = st.checkbox(
+        "Include finished matches",
+        value=False,
+        key="sidebar_show_expired",
+    )
 
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-title">💰 Simulation</div>', unsafe_allow_html=True)
@@ -403,10 +420,21 @@ fdf = df[df["spotted_at"] >= cutoff].copy()
 fdf = fdf[fdf["league_name"].isin(sel_leagues)]
 fdf = fdf[fdf["avg_odds"] >= min_odds_filter]
 
-if status_filter == "Pending":      fdf = fdf[fdf["pending"]]
-elif status_filter == "Won":        fdf = fdf[fdf["won"]]
-elif status_filter == "Lost":       fdf = fdf[fdf["lost"]]
-elif status_filter == "Bet Placed": fdf = fdf[fdf["bet_placed"] == True]
+if status_filter == "Active":
+    fdf = fdf[fdf["active"]]
+elif status_filter == "Pending":
+    fdf = fdf[fdf["pending"]]
+elif status_filter == "Won":
+    fdf = fdf[fdf["won"]]
+elif status_filter == "Lost":
+    fdf = fdf[fdf["lost"]]
+elif status_filter == "Expired":
+    fdf = fdf[fdf["expired"] & ~fdf["won"] & ~fdf["lost"]]
+elif status_filter == "Bet Placed":
+    fdf = fdf[fdf["bet_placed"] == True]
+
+if not show_expired and status_filter not in ["All", "Expired", "Won", "Lost"]:
+    fdf = fdf[~fdf["expired"] | fdf["bet_placed"] | fdf["won"] | fdf["lost"]]
 
 resolved = fdf[~fdf["pending"]].copy()
 placed   = fdf[fdf["bet_placed"] == True].copy()
@@ -431,24 +459,26 @@ draws   = int(fdf["lost"].sum())
 pending = int(fdf["pending"].sum())
 total   = len(fdf)
 
-# FIX 8: Division by zero — guard all divisions
-win_rate = (wins / (wins + draws) * 100) if (wins + draws) > 0 else 0.0
-total_pl = int(resolved["actual_profit"].sum() * (stake / 5000)) if not resolved.empty else 0
-n_placed = int((fdf["bet_placed"] == True).sum())
-avg_ev   = round(fdf["ev_score"].mean(), 2) if not fdf.empty else 0
+win_rate     = (wins / (wins + draws) * 100) if (wins + draws) > 0 else 0.0
+total_pl     = int(resolved["actual_profit"].sum() * (stake / 5000)) if not resolved.empty else 0
+n_placed     = int((fdf["bet_placed"] == True).sum())
+avg_ev       = round(fdf["ev_score"].mean(), 2) if not fdf.empty else 0
 
-# FIX 6: Column variable reuse — use unique names hdr_c* for header metrics row
-hdr_c1, hdr_c2, hdr_c3, hdr_c4, hdr_c5, hdr_c6, hdr_c7 = st.columns(7)
+active_count  = int(fdf["active"].sum())
+expired_count = max(int(fdf["expired"].sum()) - wins - draws, 0)
+
+hdr_c1, hdr_c2, hdr_c3, hdr_c4, hdr_c5, hdr_c6, hdr_c7, hdr_c8 = st.columns(8)
 hdr_c1.metric("Opportunities", f"{total:,}")
-hdr_c2.metric(
+hdr_c2.metric("🟢 Active", f"{active_count:,}", "pre-match")
+hdr_c3.metric(
     "Bets Placed", f"{n_placed:,}",
     f"{n_placed / total * 100:.0f}% of opps" if total else "0%",
 )
-hdr_c3.metric("Won", f"{wins:,}", f"{win_rate:.1f}% win rate")
-hdr_c4.metric("Lost to Draw", f"{draws:,}")
-hdr_c5.metric("Pending", f"{pending:,}")
-hdr_c6.metric("Simulated P&L", f"${total_pl:,}")
-hdr_c7.metric("Avg EV Score", f"+{avg_ev}" if avg_ev >= 0 else str(avg_ev))
+hdr_c4.metric("Won", f"{wins:,}", f"{win_rate:.1f}% win rate")
+hdr_c5.metric("Lost to Draw", f"{draws:,}")
+hdr_c6.metric("⏰ Expired", f"{expired_count:,}", "needs result")
+hdr_c7.metric("Simulated P&L", f"${total_pl:,}")
+hdr_c8.metric("Avg EV Score", f"+{avg_ev}" if avg_ev >= 0 else str(avg_ev))
 
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
@@ -469,7 +499,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 #   TAB 1 — OVERVIEW
 # ══════════════════════════════════════════════════════════
 with tab1:
-    # FIX 6: renamed to t1_col_a / t1_col_b to avoid collision with other tabs
     t1_col_a, t1_col_b = st.columns([2, 1])
 
     with t1_col_a:
@@ -557,7 +586,6 @@ with tab1:
     )
     color_map = {"home_win": GREEN, "away_win": GREEN2, "draw": RED, "None": MUTED}
 
-    # FIX 4: ev_score <= 0 crash in px.scatter size param — clamp to min 0.01
     scatter_df = fdf.copy()
     scatter_df["ev_size"] = scatter_df["ev_score"].clip(lower=0.01)
 
@@ -582,7 +610,6 @@ with tab1:
 #   TAB 2 — OPPORTUNITIES
 # ══════════════════════════════════════════════════════════
 with tab2:
-    # FIX 6: prefixed keys with tab2_ to avoid collision
     t2_c1, t2_c2, t2_c3 = st.columns(3)
     with t2_c1:
         sort_by = st.selectbox(
@@ -593,7 +620,7 @@ with tab2:
     with t2_c2:
         opp_filter = st.selectbox(
             "Show",
-            ["All", "Pending only", "Bet placed", "Not bet placed"],
+            ["All", "Active only", "Pending only", "Bet placed", "Not bet placed", "Expired"],
             key="tab2_filter",
         )
     with t2_c3:
@@ -602,9 +629,11 @@ with tab2:
         )
 
     dff = fdf.copy()
-    if opp_filter == "Pending only":     dff = dff[dff["pending"]]
+    if opp_filter == "Active only":      dff = dff[dff["active"]]
+    elif opp_filter == "Pending only":   dff = dff[dff["pending"]]
     elif opp_filter == "Bet placed":     dff = dff[dff["bet_placed"] == True]
     elif opp_filter == "Not bet placed": dff = dff[dff["bet_placed"] != True]
+    elif opp_filter == "Expired":        dff = dff[dff["expired"] & ~dff["won"] & ~dff["lost"]]
     if league_quick != "All":            dff = dff[dff["league_name"] == league_quick]
 
     if sort_by == "Highest EV":          dff = dff.sort_values("ev_score", ascending=False)
@@ -617,19 +646,21 @@ with tab2:
         unsafe_allow_html=True,
     )
 
-    # FIX 1 + 10: Duplicate key crash & expander key collisions
-    # Use enumerate index in every widget key so keys are globally unique
     for opp_idx, (_, row) in enumerate(dff.head(60).iterrows()):
         ph = round(stake * row["home_odds"] - stake * 2)
         pa = round(stake * row["away_odds"] - stake * 2)
         is_placed = _row_get(row, "bet_placed", False) is True or _row_get(row, "bet_placed", False) == True
 
-        if row["won"]:    rb = '<span class="badge badge-green">✓ Won</span>'
-        elif row["lost"]: rb = '<span class="badge badge-red">✗ Draw loss</span>'
-        else:             rb = '<span class="badge badge-muted">⏳ Pending</span>'
+        if row["won"]:
+            rb = '<span class="badge badge-green">✓ Won</span>'
+        elif row["lost"]:
+            rb = '<span class="badge badge-red">✗ Draw loss</span>'
+        elif row["expired"]:
+            rb = '<span class="badge badge-red">⏰ Expired</span>'
+        else:
+            rb = '<span class="badge badge-muted">⏳ Active</span>'
 
         pb = '<span class="badge badge-yellow">💰 Bet placed</span>' if is_placed else ''
-        # FIX 7: use _row_get instead of row.get()
         hb = _row_get(row, "home_bookmaker", "Bet365") or "Bet365"
         ab = _row_get(row, "away_bookmaker", "1xBet") or "1xBet"
 
@@ -645,11 +676,10 @@ with tab2:
         </div>
         """
 
-        # FIX 10: expander label is unique enough; inner widget keys include opp_idx
+        spotted_str = safe_strftime(row["spotted_at"])
         with st.expander(
             f"{row['home_team']} vs {row['away_team']} · "
-            f"{row['league_name']} · {row['avg_odds']}x avg · "
-            f"{row['spotted_at'].strftime('%b %d %H:%M')}"
+            f"{row['league_name']} · {row['avg_odds']}x avg · {spotted_str}"
         ):
             st.markdown(header, unsafe_allow_html=True)
 
@@ -675,7 +705,6 @@ with tab2:
 
             bc1, bc2 = st.columns(2)
             with bc1:
-                # FIX 1: unique key includes opp_idx — no more duplicate key crash
                 new_placed = st.checkbox(
                     "✅ Mark as bet placed",
                     value=bool(is_placed),
@@ -688,8 +717,18 @@ with tab2:
                         st.rerun()
             with bc2:
                 mt = _row_get(row, "commence_time")
-                mt_str = mt.strftime('%b %d %H:%M') if pd.notna(mt) else "TBD"
-                st.caption(f"Match: {mt_str}\nSpotted: {row['spotted_at'].strftime('%b %d %H:%M')}")
+                mt_str = safe_strftime(mt, "%b %d %H:%M")
+                if row["expired"] and not row["won"] and not row["lost"]:
+                    st.caption(
+                        f"⏰ Match started: {mt_str}\n"
+                        f"Spotted: {spotted_str}\n"
+                        "⚠️ Update result in Tab 6"
+                    )
+                else:
+                    st.caption(
+                        f"Match: {mt_str}\n"
+                        f"Spotted: {spotted_str}"
+                    )
 
 # ══════════════════════════════════════════════════════════
 #   TAB 3 — MY BETS
@@ -706,7 +745,6 @@ with tab3:
         placed_resolved = placed[~placed["pending"]]
         placed_pending  = placed[placed["pending"]]
 
-        # FIX 6: use t3_ prefix
         t3_pm1, t3_pm2, t3_pm3, t3_pm4 = st.columns(4)
         t3_pm1.metric("Bets placed", len(placed))
         t3_pm2.metric("Resolved", len(placed_resolved))
@@ -720,13 +758,11 @@ with tab3:
 
         st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-        # FIX 10: enumerate for unique iteration
         for bet_idx, (_, row) in enumerate(
             placed.sort_values("spotted_at", ascending=False).iterrows()
         ):
             ph = round(stake * row["home_odds"] - stake * 2)
             pa = round(stake * row["away_odds"] - stake * 2)
-            # FIX 7
             hb = _row_get(row, "home_bookmaker", "Bet365") or "Bet365"
             ab = _row_get(row, "away_bookmaker", "1xBet") or "1xBet"
 
@@ -739,17 +775,20 @@ with tab3:
                 status_html = f'<span class="badge badge-green">✓ WON +${ap:,}</span>'
             elif row["lost"]:
                 status_html = f'<span class="badge badge-red">✗ DRAW LOSS -${stake * 2:,}</span>'
+            elif row["expired"]:
+                status_html = '<span class="badge badge-red">⏰ MATCH FINISHED — UPDATE RESULT</span>'
             else:
-                status_html = '<span class="badge badge-yellow">⏳ AWAITING RESULT</span>'
+                status_html = '<span class="badge badge-yellow">⏳ AWAITING KICKOFF</span>'
 
+            spotted_str = safe_strftime(row["spotted_at"], "%b %d, %H:%M")
             st.markdown(f"""
-            <div class="opp-card {'opp-card-won' if row['won'] else 'opp-card-lost' if row['lost'] else 'opp-card-placed'}">
+            <div class="opp-card {'opp-card-won' if row['won'] else 'opp-card-lost' if row['lost'] else 'opp-card-expired' if row['expired'] else 'opp-card-placed'}">
               <div style="display:flex;justify-content:space-between;align-items:flex-start">
                 <div>
                   <div style="font-family:'Syne',sans-serif;font-size:15px;font-weight:700;color:#e8edf5;margin-bottom:4px">
                     {row['home_team']} vs {row['away_team']}
                   </div>
-                  <div style="font-size:12px;color:#5a6a82">{row['league_name']} · {row['spotted_at'].strftime('%b %d, %H:%M')}</div>
+                  <div style="font-size:12px;color:#5a6a82">{row['league_name']} · {spotted_str}</div>
                 </div>
                 {status_html}
               </div>
@@ -796,7 +835,6 @@ with tab3:
 #   TAB 4 — ANALYTICS
 # ══════════════════════════════════════════════════════════
 with tab4:
-    # FIX 6: t4_ prefix
     t4_c1, t4_c2 = st.columns(2)
     with t4_c1:
         st.markdown('<div class="section-title">By hour of day</div>', unsafe_allow_html=True)
@@ -878,7 +916,6 @@ with tab4:
         avg_away=("away_odds", "mean"),
         avg_ev=("ev_score", "mean"),
     ).reset_index()
-    # FIX 8: division by zero in win_rate
     ls["win_rate%"] = (
         ls.apply(
             lambda r: round(r["wins"] / (r["wins"] + r["draws"]) * 100, 1)
@@ -944,27 +981,60 @@ with tab6:
     st.markdown('<div class="section-title">Update match results</div>', unsafe_allow_html=True)
     st.markdown("After a match ends, update the result here to track accuracy and P&L.")
 
-    pend_df = (
-        fdf[fdf["pending"]]
+    expired_pending = (
+        fdf[fdf["expired"] & fdf["pending"]]
         .sort_values("commence_time")
         .drop_duplicates(subset="match_id")
     )
+    other_pending = (
+        fdf[~fdf["expired"] & fdf["pending"]]
+        .sort_values("commence_time")
+        .drop_duplicates(subset="match_id")
+    )
+    pend_df = pd.concat([expired_pending, other_pending], ignore_index=True)
 
     if pend_df.empty:
         st.success("No pending matches!")
     else:
-        st.markdown(f"**{len(pend_df)}** matches awaiting results")
+        if not expired_pending.empty:
+            st.warning(
+                f"⏰ **{len(expired_pending)} matches have already started** — "
+                "enter their results below to update your P&L."
+            )
+        if not other_pending.empty:
+            st.info(f"🟢 **{len(other_pending)} upcoming matches** awaiting kickoff.")
 
-        # FIX 2 + 10: All Tab 6 widget keys use t6_ prefix + loop index
+        st.markdown(f"**{len(pend_df)}** total matches awaiting results")
+
         for t6_idx, (_, row) in enumerate(pend_df.head(30).iterrows()):
+            expiry_marker = "⏰ FINISHED · " if row["expired"] else "🟢 UPCOMING · "
+            spotted_str = safe_strftime(row["spotted_at"], "%b %d")
             with st.expander(
-                f"{row['home_team']} vs {row['away_team']} · "
-                f"{row['league_name']} · {row['spotted_at'].strftime('%b %d')}"
+                f"{expiry_marker}{row['home_team']} vs {row['away_team']} · "
+                f"{row['league_name']} · {spotted_str}"
             ):
+                mt = _row_get(row, "commence_time")
+                mt_str = safe_strftime(mt, "%b %d %H:%M UTC")
+                if row["expired"]:
+                    st.markdown(
+                        f'<div style="background:rgba(255,68,85,0.08);border:1px solid '
+                        f'rgba(255,68,85,0.2);border-radius:8px;padding:10px 14px;'
+                        f'margin-bottom:12px;font-family:Space Mono,monospace;font-size:12px;'
+                        f'color:#ff4455">⏰ Match started: {mt_str} — please enter result</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div style="background:rgba(0,255,136,0.05);border:1px solid '
+                        f'rgba(0,255,136,0.15);border-radius:8px;padding:10px 14px;'
+                        f'margin-bottom:12px;font-family:Space Mono,monospace;font-size:12px;'
+                        f'color:#00ff88">🟢 Kicks off: {mt_str}</div>',
+                        unsafe_allow_html=True,
+                    )
+
                 uc1, uc2, uc3 = st.columns([2, 1, 1])
 
                 with uc1:
-                    # FIX 2: t6_ prefix on all keys in this tab
                     sel = st.selectbox(
                         "Result",
                         ["Select...", "home_win", "away_win", "draw"],
@@ -980,7 +1050,6 @@ with tab6:
                     elif sel == "draw":
                         st.metric("Loss", f"-${stake * 2:,}")
                 with uc3:
-                    # FIX 2: t6_ prefix
                     placed_check = st.checkbox(
                         "Bet was placed",
                         value=bool(_row_get(row, "bet_placed", False)),
@@ -992,7 +1061,6 @@ with tab6:
                     elif sel == "away_win": ap = round(5000 * row["away_odds"] - 10000)
                     else:                   ap = -10000
 
-                    # FIX 2: t6_ prefix
                     if st.button("💾 Save result", key=f"t6_sv_{row['match_id']}_{t6_idx}"):
                         ok = sb_patch("opportunities", row["match_id"], {
                             "result": sel,
@@ -1012,12 +1080,10 @@ with tab6:
 with tab7:
     st.markdown('<div class="section-title">P&L tracker</div>', unsafe_allow_html=True)
 
-    # FIX 6: t7_ prefix for all columns in this tab
     t7_c1, t7_c2, t7_c3, t7_c4 = st.columns(4)
     t7_c1.metric("Stake per side", f"${stake:,}")
     t7_c2.metric("Total invested (sim)", f"${stake * 2 * total:,}")
     t7_c3.metric("Net P&L (sim)", f"${total_pl:,}")
-    # FIX 8: division by zero in ROI
     roi = (total_pl / (stake * 2 * len(resolved)) * 100) if len(resolved) > 0 else 0.0
     t7_c4.metric("ROI", f"{roi:.1f}%")
 
@@ -1072,7 +1138,7 @@ with tab7:
             "spotted_at", "home_team", "away_team", "league_name",
             "home_odds", "away_odds", "result", "sim", "cumpl",
         ]].copy()
-        log_df["spotted_at"] = log_df["spotted_at"].dt.strftime("%b %d %H:%M")
+        log_df["spotted_at"] = log_df["spotted_at"].apply(lambda x: safe_strftime(x, "%b %d %H:%M"))
         log_df["sim"]   = log_df["sim"].apply(lambda x: f"+${x:,.0f}" if x > 0 else f"-${abs(x):,.0f}")
         log_df["cumpl"] = log_df["cumpl"].apply(lambda x: f"${x:,.0f}")
         log_df.columns  = [
@@ -1089,7 +1155,6 @@ with tab7:
     )
     t7_wc1, t7_wc2, t7_wc3 = st.columns(3)
     with t7_wc1:
-        # FIX 3: Slider key conflict sidebar vs Tab 7 — explicit unique key "wi_stake_slider"
         wi_stake = st.slider(
             "Stake per side ($)", 100, 50_000, stake, 500,
             key="wi_stake_slider",
@@ -1102,7 +1167,6 @@ with tab7:
         )
         st.metric(f"P&L with ${wi_stake:,} stake", f"${wi_pl:,}")
     with t7_wc3:
-        # FIX 8: division by zero in wi_roi
         wi_roi = (
             (wi_pl / (wi_stake * 2 * len(resolved)) * 100)
             if len(resolved) > 0
