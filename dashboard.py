@@ -2,6 +2,19 @@
 ============================================================
   ODDS MONITOR DASHBOARD v3  —  dashboard.py
   Enhanced UI + bet tracking + full analytics
+
+  FIXES APPLIED:
+  1.  Duplicate checkbox key crash        → unique keys via enumerate index
+  2.  Tab 6 widget key namespacing        → t6_ prefix on all Tab 6 widgets
+  3.  Slider key conflict sidebar vs Tab7 → Tab 7 slider uses key="wi_stake_slider"
+  4.  ev_score <= 0 crash in px.scatter   → size col clamped to min 0.01
+  5.  Timezone-aware tz_localize TypeError→ strip tz before localize with utc param
+  6.  Column variable reuse across tabs   → renamed c1/c2 per tab (t1_, t2_, etc.)
+  7.  Unsafe row.get() on pandas Series  → row[col] with explicit default via .get workaround
+  8.  Division by zero in metrics & ROI  → all divisions guarded with `or 1` / `if` checks
+  9.  st.secrets crash without secrets.toml → try/except around st.secrets access
+  10. Expander key collisions + iterrows  → use enumerate; keys include loop index
+  11. Bare except + mutable default arg   → specific Exception catches; no mutable defaults
 ============================================================
 """
 
@@ -180,8 +193,15 @@ BLUE   = "#4488ff"
 MUTED  = "#1a2233"
 
 # ── CONFIG ───────────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", st.secrets.get("SUPABASE_KEY", ""))
+# FIX 9: st.secrets crash without secrets.toml — wrapped in try/except
+def _secret(key: str, fallback: str = "") -> str:
+    try:
+        return st.secrets.get(key, fallback)
+    except Exception:
+        return fallback
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", _secret("SUPABASE_URL", ""))
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", _secret("SUPABASE_KEY", ""))
 
 LEAGUE_NAMES = {
     "soccer_epl":                "Premier League 🏴󠁧󠁢󠁥󠁮󠁧󠁿",
@@ -202,32 +222,63 @@ BOOKMAKERS = {
 }
 
 # ── SUPABASE ─────────────────────────────────────────────────
-def sb_get(table, params={}):
-    h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+# FIX 11: Specific Exception instead of bare except
+def sb_get(table: str, params: dict | None = None) -> list:
+    """FIX 11: No mutable default arg; None sentinel used instead."""
+    if params is None:
+        params = {}
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=h, params=params, timeout=15)
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{table}", headers=h, params=params, timeout=15
+        )
         return r.json() if r.status_code == 200 else []
-    except:
+    except Exception as exc:
+        st.warning(f"DB read error: {exc}")
         return []
 
-def sb_patch(table, match_id, data):
-    h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-         "Content-Type": "application/json", "Prefer": "return=representation"}
+
+def sb_patch(table: str, match_id: str, data: dict) -> bool:
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
     try:
-        r = requests.patch(f"{SUPABASE_URL}/rest/v1/{table}?match_id=eq.{match_id}",
-                           headers=h, json=data, timeout=15)
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}?match_id=eq.{match_id}",
+            headers=h, json=data, timeout=15,
+        )
         return r.status_code in [200, 204]
-    except:
+    except Exception as exc:
+        st.warning(f"DB write error: {exc}")
         return False
 
+
+# FIX 5: Timezone-aware tz_localize TypeError
+# Use utc=True in pd.to_datetime so tz-aware strings parse correctly,
+# then convert to UTC-naive via dt.tz_convert(None) instead of tz_localize(None).
+def _to_naive_utc(series: pd.Series) -> pd.Series:
+    parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    return parsed.dt.tz_convert(None)
+
+
 @st.cache_data(ttl=180)
-def load_data():
+def load_data() -> pd.DataFrame:
     rows = sb_get("opportunities", {"order": "spotted_at.desc", "limit": 1000})
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["spotted_at"]    = pd.to_datetime(df["spotted_at"]).dt.tz_localize(None)
-    df["commence_time"] = pd.to_datetime(df["commence_time"], errors="coerce").dt.tz_localize(None)
+
+    # FIX 5 applied here
+    df["spotted_at"]    = _to_naive_utc(df["spotted_at"])
+    df["commence_time"] = _to_naive_utc(df["commence_time"])
+
     df["date"]          = df["spotted_at"].dt.date
     df["hour"]          = df["spotted_at"].dt.hour
     df["dow"]           = df["spotted_at"].dt.day_name()
@@ -237,21 +288,28 @@ def load_data():
     df["league_name"]   = df["league"].map(LEAGUE_NAMES).fillna(df["league"])
     df["avg_odds"]      = ((df["home_odds"] + df["away_odds"]) / 2).round(2)
     df["ev_score"]      = (df["avg_odds"] - 2.0).round(3)
-    # FIX: df.get() returns scalar False when column missing — can't call .fillna() on it
+
+    # Original fix (preserved): df.get() returns scalar — use column check instead
     if "bet_placed" in df.columns:
         df["bet_placed"] = df["bet_placed"].fillna(False)
     else:
         df["bet_placed"] = False
+
     return df
 
-def demo_data():
+
+def demo_data() -> pd.DataFrame:
     np.random.seed(99)
     n   = 140
     now = datetime.utcnow()
     leagues = list(LEAGUE_NAMES.keys())
-    results = np.random.choice(["home_win","away_win","draw",None], n, p=[0.40,0.37,0.11,0.12])
-    ht = ["Bayern","Real Madrid","Man City","Barcelona","PSG","Arsenal","Juventus","Inter","Liverpool","Dortmund","Napoli","Porto"]
-    at = ["Atletico","Napoli","Porto","Ajax","Lazio","Milan","Sevilla","Lyon","Leicester","Freiburg","Udinese","Braga"]
+    results = np.random.choice(
+        ["home_win", "away_win", "draw", None], n, p=[0.40, 0.37, 0.11, 0.12]
+    )
+    ht = ["Bayern","Real Madrid","Man City","Barcelona","PSG","Arsenal",
+          "Juventus","Inter","Liverpool","Dortmund","Napoli","Porto"]
+    at = ["Atletico","Napoli","Porto","Ajax","Lazio","Milan",
+          "Sevilla","Lyon","Leicester","Freiburg","Udinese","Braga"]
     bks = ["Bet365","1xBet","William Hill","Bwin","Pinnacle","Unibet"]
     data = []
     for i in range(n):
@@ -263,7 +321,10 @@ def demo_data():
         if res == "home_win":   ap = round(5000 * ho - 10000)
         elif res == "away_win": ap = round(5000 * ao - 10000)
         elif res == "draw":     ap = -10000
-        spot = now - timedelta(days=int(np.random.uniform(0,30)), hours=int(np.random.uniform(0,24)))
+        spot = now - timedelta(
+            days=int(np.random.uniform(0, 30)),
+            hours=int(np.random.uniform(0, 24)),
+        )
         placed = np.random.random() < 0.3
         data.append({
             "match_id":            f"match_{i}",
@@ -286,7 +347,7 @@ def demo_data():
             "date":                spot.date(),
             "hour":                spot.hour,
             "dow":                 spot.strftime("%A"),
-            "won":                 res in ["home_win","away_win"],
+            "won":                 res in ["home_win", "away_win"],
             "lost":                res == "draw",
             "pending":             res is None,
             "avg_odds":            round((ho + ao) / 2, 2),
@@ -296,12 +357,24 @@ def demo_data():
         })
     return pd.DataFrame(data)
 
+
+# ── HELPER: safe row field access for pandas Series ──────────
+# FIX 7: Unsafe row.get() on pandas Series — use _row_get() wrapper
+def _row_get(row: pd.Series, key: str, default=None):
+    """Safe field access that works for both dict and pd.Series."""
+    try:
+        val = row[key]
+        return default if pd.isna(val) else val
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
 # ══════════════════════════════════════════════════════════
 #   SIDEBAR
 # ══════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown('<div class="section-title">⚙ Filters</div>', unsafe_allow_html=True)
-    days_back = st.slider("Days", 1, 90, 30)
+    days_back = st.slider("Days", 1, 90, 30)          # key="days_back" implicit — unique
     all_leagues = list(LEAGUE_NAMES.values())
     sel_leagues = st.multiselect("Leagues", all_leagues, default=all_leagues)
     min_odds_filter = st.slider("Min avg odds", 2.0, 4.0, 2.0, 0.05)
@@ -309,7 +382,7 @@ with st.sidebar:
 
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-title">💰 Simulation</div>', unsafe_allow_html=True)
-    stake = st.number_input("Stake per side ($)", 100, 100000, 5000, 500)
+    stake = st.number_input("Stake per side ($)", 100, 100_000, 5000, 500)
 
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     if st.button("🔄 Refresh"):
@@ -353,23 +426,29 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── TOP METRICS ──────────────────────────────────────────────
-wins     = int(fdf["won"].sum())
-draws    = int(fdf["lost"].sum())
-pending  = int(fdf["pending"].sum())
-total    = len(fdf)
-win_rate = (wins / (wins + draws) * 100) if (wins + draws) > 0 else 0
+wins    = int(fdf["won"].sum())
+draws   = int(fdf["lost"].sum())
+pending = int(fdf["pending"].sum())
+total   = len(fdf)
+
+# FIX 8: Division by zero — guard all divisions
+win_rate = (wins / (wins + draws) * 100) if (wins + draws) > 0 else 0.0
 total_pl = int(resolved["actual_profit"].sum() * (stake / 5000)) if not resolved.empty else 0
 n_placed = int((fdf["bet_placed"] == True).sum())
 avg_ev   = round(fdf["ev_score"].mean(), 2) if not fdf.empty else 0
 
-c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
-c1.metric("Opportunities", f"{total:,}")
-c2.metric("Bets Placed", f"{n_placed:,}", f"{n_placed/total*100:.0f}% of opps" if total else "0%")
-c3.metric("Won", f"{wins:,}", f"{win_rate:.1f}% win rate")
-c4.metric("Lost to Draw", f"{draws:,}")
-c5.metric("Pending", f"{pending:,}")
-c6.metric("Simulated P&L", f"${total_pl:,}")
-c7.metric("Avg EV Score", f"+{avg_ev}" if avg_ev >= 0 else str(avg_ev))
+# FIX 6: Column variable reuse — use unique names hdr_c* for header metrics row
+hdr_c1, hdr_c2, hdr_c3, hdr_c4, hdr_c5, hdr_c6, hdr_c7 = st.columns(7)
+hdr_c1.metric("Opportunities", f"{total:,}")
+hdr_c2.metric(
+    "Bets Placed", f"{n_placed:,}",
+    f"{n_placed / total * 100:.0f}% of opps" if total else "0%",
+)
+hdr_c3.metric("Won", f"{wins:,}", f"{win_rate:.1f}% win rate")
+hdr_c4.metric("Lost to Draw", f"{draws:,}")
+hdr_c5.metric("Pending", f"{pending:,}")
+hdr_c6.metric("Simulated P&L", f"${total_pl:,}")
+hdr_c7.metric("Avg EV Score", f"+{avg_ev}" if avg_ev >= 0 else str(avg_ev))
 
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
@@ -390,32 +469,41 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 #   TAB 1 — OVERVIEW
 # ══════════════════════════════════════════════════════════
 with tab1:
-    col_a, col_b = st.columns([2,1])
+    # FIX 6: renamed to t1_col_a / t1_col_b to avoid collision with other tabs
+    t1_col_a, t1_col_b = st.columns([2, 1])
 
-    with col_a:
+    with t1_col_a:
         st.markdown('<div class="section-title">Opportunities per day</div>', unsafe_allow_html=True)
         daily = fdf.groupby("date").size().reset_index(name="count")
         fig = px.bar(daily, x="date", y="count", color_discrete_sequence=[GREEN])
         fig.update_traces(marker_line_width=0)
-        fig.update_layout(**CHART, height=220,
-                          xaxis=dict(showgrid=False, color="#374151"),
-                          yaxis=dict(gridcolor="#1a2233", color="#374151"))
+        fig.update_layout(
+            **CHART, height=220,
+            xaxis=dict(showgrid=False, color="#374151"),
+            yaxis=dict(gridcolor="#1a2233", color="#374151"),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-    with col_b:
+    with t1_col_b:
         st.markdown('<div class="section-title">By league</div>', unsafe_allow_html=True)
-        by_l = fdf.groupby("league_name").size().reset_index(name="count").sort_values("count")
+        by_l = (
+            fdf.groupby("league_name").size()
+            .reset_index(name="count")
+            .sort_values("count")
+        )
         fig2 = px.bar(by_l, x="count", y="league_name", orientation="h",
                       color_discrete_sequence=[GREEN2])
         fig2.update_traces(marker_line_width=0)
-        fig2.update_layout(**CHART, height=220,
-                           xaxis=dict(showgrid=False),
-                           yaxis=dict(showgrid=False, title=""))
+        fig2.update_layout(
+            **CHART, height=220,
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=False, title=""),
+        )
         st.plotly_chart(fig2, use_container_width=True)
 
-    col_c, col_d = st.columns([2,1])
+    t1_col_c, t1_col_d = st.columns([2, 1])
 
-    with col_c:
+    with t1_col_c:
         st.markdown('<div class="section-title">Cumulative P&L simulation</div>', unsafe_allow_html=True)
         if not resolved.empty:
             r2 = resolved.sort_values("spotted_at").copy()
@@ -426,20 +514,26 @@ with tab1:
             fig3.add_trace(go.Scatter(
                 x=r2["spotted_at"], y=r2["cumpl"],
                 fill="tozeroy",
-                fillcolor="rgba(0,255,136,0.07)" if r2["cumpl"].iloc[-1] >= 0 else "rgba(255,68,85,0.07)",
-                line=dict(color=color_line, width=2.5), name="P&L"
+                fillcolor=(
+                    "rgba(0,255,136,0.07)"
+                    if r2["cumpl"].iloc[-1] >= 0
+                    else "rgba(255,68,85,0.07)"
+                ),
+                line=dict(color=color_line, width=2.5), name="P&L",
             ))
             fig3.add_hline(y=0, line_dash="dot", line_color="#243044")
-            fig3.update_layout(**CHART, height=240,
-                               yaxis=dict(gridcolor="#1a2233", tickprefix="$"),
-                               xaxis=dict(showgrid=False), showlegend=False)
+            fig3.update_layout(
+                **CHART, height=240,
+                yaxis=dict(gridcolor="#1a2233", tickprefix="$"),
+                xaxis=dict(showgrid=False), showlegend=False,
+            )
             st.plotly_chart(fig3, use_container_width=True)
         else:
             st.markdown("""<div style="background:#0d1117;border:1px dashed #1a2233;border-radius:10px;
             padding:40px;text-align:center;color:#5a6a82;font-family:'Space Mono',monospace;font-size:12px">
             Add match results to see P&L curve</div>""", unsafe_allow_html=True)
 
-    with col_d:
+    with t1_col_d:
         st.markdown('<div class="section-title">Result breakdown</div>', unsafe_allow_html=True)
         if wins + draws > 0:
             fig4 = go.Figure(go.Pie(
@@ -447,66 +541,97 @@ with tab1:
                 marker_colors=[GREEN, RED], textinfo="percent+label",
                 textfont=dict(family="Space Mono", size=11),
             ))
-            fig4.update_layout(**CHART, height=240, showlegend=False,
-                               margin=dict(l=0,r=0,t=10,b=0))
+            fig4.update_layout(
+                **CHART, height=240, showlegend=False,
+                margin=dict(l=0, r=0, t=10, b=0),
+            )
             st.plotly_chart(fig4, use_container_width=True)
         else:
             st.markdown("""<div style="background:#0d1117;border:1px dashed #1a2233;border-radius:10px;
             padding:40px;text-align:center;color:#5a6a82;font-family:'Space Mono',monospace;font-size:12px">
             No results yet</div>""", unsafe_allow_html=True)
 
-    st.markdown('<div class="section-title">Odds landscape — dot size = EV score</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-title">Odds landscape — dot size = EV score</div>',
+        unsafe_allow_html=True,
+    )
     color_map = {"home_win": GREEN, "away_win": GREEN2, "draw": RED, "None": MUTED}
-    fig5 = px.scatter(fdf, x="home_odds", y="away_odds",
-                      color=fdf["result"].fillna("None"),
-                      color_discrete_map=color_map,
-                      size="ev_score", size_max=18,
-                      hover_data=["home_team","away_team","league_name","avg_odds"])
+
+    # FIX 4: ev_score <= 0 crash in px.scatter size param — clamp to min 0.01
+    scatter_df = fdf.copy()
+    scatter_df["ev_size"] = scatter_df["ev_score"].clip(lower=0.01)
+
+    fig5 = px.scatter(
+        scatter_df, x="home_odds", y="away_odds",
+        color=scatter_df["result"].fillna("None"),
+        color_discrete_map=color_map,
+        size="ev_size", size_max=18,
+        hover_data=["home_team", "away_team", "league_name", "avg_odds"],
+    )
     fig5.add_vline(x=2.0, line_dash="dot", line_color="#243044",
                    annotation_text="2x", annotation_font_color="#5a6a82")
     fig5.add_hline(y=2.0, line_dash="dot", line_color="#243044")
-    fig5.update_layout(**CHART, height=360,
-                       xaxis=dict(gridcolor="#1a2233", title="Home odds (x)"),
-                       yaxis=dict(gridcolor="#1a2233", title="Away odds (x)"))
+    fig5.update_layout(
+        **CHART, height=360,
+        xaxis=dict(gridcolor="#1a2233", title="Home odds (x)"),
+        yaxis=dict(gridcolor="#1a2233", title="Away odds (x)"),
+    )
     st.plotly_chart(fig5, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════
 #   TAB 2 — OPPORTUNITIES
 # ══════════════════════════════════════════════════════════
 with tab2:
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        sort_by = st.selectbox("Sort by", ["Most recent","Highest EV","Highest home odds","Highest away odds"], key="tab2_sort")
-    with c2:
-        opp_filter = st.selectbox("Show", ["All","Pending only","Bet placed","Not bet placed"], key="tab2_filter")
-    with c3:
-        league_quick = st.selectbox("League", ["All"] + list(LEAGUE_NAMES.values()), key="tab2_league")
+    # FIX 6: prefixed keys with tab2_ to avoid collision
+    t2_c1, t2_c2, t2_c3 = st.columns(3)
+    with t2_c1:
+        sort_by = st.selectbox(
+            "Sort by",
+            ["Most recent", "Highest EV", "Highest home odds", "Highest away odds"],
+            key="tab2_sort",
+        )
+    with t2_c2:
+        opp_filter = st.selectbox(
+            "Show",
+            ["All", "Pending only", "Bet placed", "Not bet placed"],
+            key="tab2_filter",
+        )
+    with t2_c3:
+        league_quick = st.selectbox(
+            "League", ["All"] + list(LEAGUE_NAMES.values()), key="tab2_league"
+        )
 
     dff = fdf.copy()
-    if opp_filter == "Pending only":      dff = dff[dff["pending"]]
-    elif opp_filter == "Bet placed":      dff = dff[dff["bet_placed"] == True]
-    elif opp_filter == "Not bet placed":  dff = dff[dff["bet_placed"] != True]
-    if league_quick != "All":             dff = dff[dff["league_name"] == league_quick]
+    if opp_filter == "Pending only":     dff = dff[dff["pending"]]
+    elif opp_filter == "Bet placed":     dff = dff[dff["bet_placed"] == True]
+    elif opp_filter == "Not bet placed": dff = dff[dff["bet_placed"] != True]
+    if league_quick != "All":            dff = dff[dff["league_name"] == league_quick]
 
-    if sort_by == "Highest EV":           dff = dff.sort_values("ev_score", ascending=False)
-    elif sort_by == "Highest home odds":  dff = dff.sort_values("home_odds", ascending=False)
-    elif sort_by == "Highest away odds":  dff = dff.sort_values("away_odds", ascending=False)
-    else:                                 dff = dff.sort_values("spotted_at", ascending=False)
+    if sort_by == "Highest EV":          dff = dff.sort_values("ev_score", ascending=False)
+    elif sort_by == "Highest home odds": dff = dff.sort_values("home_odds", ascending=False)
+    elif sort_by == "Highest away odds": dff = dff.sort_values("away_odds", ascending=False)
+    else:                                dff = dff.sort_values("spotted_at", ascending=False)
 
-    st.markdown(f'<div class="section-title">Showing {len(dff)} opportunities</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="section-title">Showing {len(dff)} opportunities</div>',
+        unsafe_allow_html=True,
+    )
 
-    for _, row in dff.head(60).iterrows():
+    # FIX 1 + 10: Duplicate key crash & expander key collisions
+    # Use enumerate index in every widget key so keys are globally unique
+    for opp_idx, (_, row) in enumerate(dff.head(60).iterrows()):
         ph = round(stake * row["home_odds"] - stake * 2)
         pa = round(stake * row["away_odds"] - stake * 2)
-        is_placed = row.get("bet_placed", False) == True
+        is_placed = _row_get(row, "bet_placed", False) is True or _row_get(row, "bet_placed", False) == True
 
         if row["won"]:    rb = '<span class="badge badge-green">✓ Won</span>'
         elif row["lost"]: rb = '<span class="badge badge-red">✗ Draw loss</span>'
         else:             rb = '<span class="badge badge-muted">⏳ Pending</span>'
 
         pb = '<span class="badge badge-yellow">💰 Bet placed</span>' if is_placed else ''
-        hb = row.get("home_bookmaker","Bet365") or "Bet365"
-        ab = row.get("away_bookmaker","1xBet")  or "1xBet"
+        # FIX 7: use _row_get instead of row.get()
+        hb = _row_get(row, "home_bookmaker", "Bet365") or "Bet365"
+        ab = _row_get(row, "away_bookmaker", "1xBet") or "1xBet"
 
         header = f"""
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
@@ -520,7 +645,12 @@ with tab2:
         </div>
         """
 
-        with st.expander(f"{row['home_team']} vs {row['away_team']} · {row['league_name']} · {row['avg_odds']}x avg · {row['spotted_at'].strftime('%b %d %H:%M')}"):
+        # FIX 10: expander label is unique enough; inner widget keys include opp_idx
+        with st.expander(
+            f"{row['home_team']} vs {row['away_team']} · "
+            f"{row['league_name']} · {row['avg_odds']}x avg · "
+            f"{row['spotted_at'].strftime('%b %d %H:%M')}"
+        ):
             st.markdown(header, unsafe_allow_html=True)
 
             mc1, mc2, mc3, mc4 = st.columns(4)
@@ -533,7 +663,7 @@ with tab2:
             pc1, pc2, pc3 = st.columns(3)
             pc1.metric(f"If {row['home_team']} wins", f"+${ph:,}")
             pc2.metric(f"If {row['away_team']} wins", f"+${pa:,}")
-            pc3.metric("If draw", f"-${stake*2:,}")
+            pc3.metric("If draw", f"-${stake * 2:,}")
 
             st.markdown(f"""
             <div style="background:#080b10;border:1px solid #1a2233;border-radius:8px;padding:12px;margin-top:8px">
@@ -545,10 +675,11 @@ with tab2:
 
             bc1, bc2 = st.columns(2)
             with bc1:
+                # FIX 1: unique key includes opp_idx — no more duplicate key crash
                 new_placed = st.checkbox(
                     "✅ Mark as bet placed",
                     value=bool(is_placed),
-                    key=f"placed_{row['match_id']}"
+                    key=f"tab2_placed_{row['match_id']}_{opp_idx}",
                 )
                 if new_placed != is_placed:
                     if sb_patch("opportunities", row["match_id"], {"bet_placed": new_placed}):
@@ -556,7 +687,7 @@ with tab2:
                         st.cache_data.clear()
                         st.rerun()
             with bc2:
-                mt = row.get("commence_time")
+                mt = _row_get(row, "commence_time")
                 mt_str = mt.strftime('%b %d %H:%M') if pd.notna(mt) else "TBD"
                 st.caption(f"Match: {mt_str}\nSpotted: {row['spotted_at'].strftime('%b %d %H:%M')}")
 
@@ -575,26 +706,39 @@ with tab3:
         placed_resolved = placed[~placed["pending"]]
         placed_pending  = placed[placed["pending"]]
 
-        pm1, pm2, pm3, pm4 = st.columns(4)
-        pm1.metric("Bets placed", len(placed))
-        pm2.metric("Resolved", len(placed_resolved))
-        pm3.metric("Pending result", len(placed_pending))
-        placed_pl = int(placed_resolved["actual_profit"].sum() * (stake/5000)) if not placed_resolved.empty else 0
-        pm4.metric("Actual P&L", f"${placed_pl:,}")
+        # FIX 6: use t3_ prefix
+        t3_pm1, t3_pm2, t3_pm3, t3_pm4 = st.columns(4)
+        t3_pm1.metric("Bets placed", len(placed))
+        t3_pm2.metric("Resolved", len(placed_resolved))
+        t3_pm3.metric("Pending result", len(placed_pending))
+        placed_pl = (
+            int(placed_resolved["actual_profit"].sum() * (stake / 5000))
+            if not placed_resolved.empty
+            else 0
+        )
+        t3_pm4.metric("Actual P&L", f"${placed_pl:,}")
 
         st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-        for _, row in placed.sort_values("spotted_at", ascending=False).iterrows():
+        # FIX 10: enumerate for unique iteration
+        for bet_idx, (_, row) in enumerate(
+            placed.sort_values("spotted_at", ascending=False).iterrows()
+        ):
             ph = round(stake * row["home_odds"] - stake * 2)
             pa = round(stake * row["away_odds"] - stake * 2)
-            hb = row.get("home_bookmaker","Bet365") or "Bet365"
-            ab = row.get("away_bookmaker","1xBet")  or "1xBet"
+            # FIX 7
+            hb = _row_get(row, "home_bookmaker", "Bet365") or "Bet365"
+            ab = _row_get(row, "away_bookmaker", "1xBet") or "1xBet"
 
             if row["won"]:
-                ap = int(row["actual_profit"] * (stake/5000)) if pd.notna(row.get("actual_profit")) else ph
+                ap = (
+                    int(row["actual_profit"] * (stake / 5000))
+                    if pd.notna(_row_get(row, "actual_profit"))
+                    else ph
+                )
                 status_html = f'<span class="badge badge-green">✓ WON +${ap:,}</span>'
             elif row["lost"]:
-                status_html = f'<span class="badge badge-red">✗ DRAW LOSS -${stake*2:,}</span>'
+                status_html = f'<span class="badge badge-red">✗ DRAW LOSS -${stake * 2:,}</span>'
             else:
                 status_html = '<span class="badge badge-yellow">⏳ AWAITING RESULT</span>'
 
@@ -619,7 +763,7 @@ with tab3:
                 <div><div style="font-size:10px;color:#5a6a82;margin-bottom:3px">IF AWAY WINS</div>
                   <div class="profit-positive">+${pa:,}</div></div>
                 <div><div style="font-size:10px;color:#5a6a82;margin-bottom:3px">IF DRAW</div>
-                  <div class="profit-negative">-${stake*2:,}</div></div>
+                  <div class="profit-negative">-${stake * 2:,}</div></div>
                 <div><div style="font-size:10px;color:#5a6a82;margin-bottom:3px">EV SCORE</div>
                   <div style="font-family:'Space Mono',monospace;color:#ffd000">+{row['ev_score']:.3f}</div></div>
               </div>
@@ -627,7 +771,10 @@ with tab3:
             """, unsafe_allow_html=True)
 
         if not placed_resolved.empty:
-            st.markdown('<div class="section-title" style="margin-top:20px">P&L from your bets</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="section-title" style="margin-top:20px">P&L from your bets</div>',
+                unsafe_allow_html=True,
+            )
             pb2 = placed_resolved.sort_values("spotted_at").copy()
             pb2["sim"]   = pb2["actual_profit"] * (stake / 5000)
             pb2["cumpl"] = pb2["sim"].cumsum()
@@ -638,48 +785,63 @@ with tab3:
                 line=dict(color=GREEN, width=2.5),
             ))
             fig_pb.add_hline(y=0, line_dash="dot", line_color="#243044")
-            fig_pb.update_layout(**CHART, height=250,
-                                 yaxis=dict(gridcolor="#1a2233", tickprefix="$"),
-                                 xaxis=dict(showgrid=False), showlegend=False)
+            fig_pb.update_layout(
+                **CHART, height=250,
+                yaxis=dict(gridcolor="#1a2233", tickprefix="$"),
+                xaxis=dict(showgrid=False), showlegend=False,
+            )
             st.plotly_chart(fig_pb, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════
 #   TAB 4 — ANALYTICS
 # ══════════════════════════════════════════════════════════
 with tab4:
-    c1, c2 = st.columns(2)
-    with c1:
+    # FIX 6: t4_ prefix
+    t4_c1, t4_c2 = st.columns(2)
+    with t4_c1:
         st.markdown('<div class="section-title">By hour of day</div>', unsafe_allow_html=True)
         hourly = fdf.groupby("hour").size().reset_index(name="count")
         fig_h = px.bar(hourly, x="hour", y="count", color_discrete_sequence=[BLUE])
-        fig_h.update_layout(**CHART, height=220,
-                            xaxis=dict(showgrid=False, title="Hour (UTC)"),
-                            yaxis=dict(gridcolor="#1a2233"))
+        fig_h.update_layout(
+            **CHART, height=220,
+            xaxis=dict(showgrid=False, title="Hour (UTC)"),
+            yaxis=dict(gridcolor="#1a2233"),
+        )
         st.plotly_chart(fig_h, use_container_width=True)
 
-    with c2:
+    with t4_c2:
         st.markdown('<div class="section-title">By day of week</div>', unsafe_allow_html=True)
         dow_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-        dow = fdf.groupby("dow").size().reindex(dow_order, fill_value=0).reset_index(name="count")
+        dow = (
+            fdf.groupby("dow").size()
+            .reindex(dow_order, fill_value=0)
+            .reset_index(name="count")
+        )
         fig_d = px.bar(dow, x="dow", y="count", color_discrete_sequence=[YELLOW])
-        fig_d.update_layout(**CHART, height=220,
-                            xaxis=dict(showgrid=False, title=""),
-                            yaxis=dict(gridcolor="#1a2233"))
+        fig_d.update_layout(
+            **CHART, height=220,
+            xaxis=dict(showgrid=False, title=""),
+            yaxis=dict(gridcolor="#1a2233"),
+        )
         st.plotly_chart(fig_d, use_container_width=True)
 
-    c3, c4 = st.columns(2)
-    with c3:
+    t4_c3, t4_c4 = st.columns(2)
+    with t4_c3:
         st.markdown('<div class="section-title">Home odds distribution</div>', unsafe_allow_html=True)
         fig_ho = px.histogram(fdf, x="home_odds", nbins=25, color_discrete_sequence=[GREEN])
-        fig_ho.update_layout(**CHART, height=200,
-                             xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#1a2233"))
+        fig_ho.update_layout(
+            **CHART, height=200,
+            xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#1a2233"),
+        )
         st.plotly_chart(fig_ho, use_container_width=True)
 
-    with c4:
+    with t4_c4:
         st.markdown('<div class="section-title">Away odds distribution</div>', unsafe_allow_html=True)
         fig_ao = px.histogram(fdf, x="away_odds", nbins=25, color_discrete_sequence=[GREEN2])
-        fig_ao.update_layout(**CHART, height=200,
-                             xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#1a2233"))
+        fig_ao.update_layout(
+            **CHART, height=200,
+            xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#1a2233"),
+        )
         st.plotly_chart(fig_ao, use_container_width=True)
 
     st.markdown('<div class="section-title">EV score over time</div>', unsafe_allow_html=True)
@@ -687,37 +849,51 @@ with tab4:
     fig_ev = go.Figure()
     fig_ev.add_trace(go.Scatter(
         x=fs["spotted_at"], y=fs["ev_score"], mode="markers",
-        marker=dict(color=GREEN, size=5, opacity=0.5), name="EV"
+        marker=dict(color=GREEN, size=5, opacity=0.5), name="EV",
     ))
     if len(fs) > 5:
         fs["ev_ma"] = fs["ev_score"].rolling(7, min_periods=1).mean()
         fig_ev.add_trace(go.Scatter(
             x=fs["spotted_at"], y=fs["ev_ma"],
-            line=dict(color=YELLOW, width=2), name="7-period MA"
+            line=dict(color=YELLOW, width=2), name="7-period MA",
         ))
-    fig_ev.add_hline(y=fs["ev_score"].mean(), line_dash="dot", line_color=BLUE,
-                     annotation_text=f"avg +{fs['ev_score'].mean():.2f}",
-                     annotation_font_color=BLUE)
-    fig_ev.update_layout(**CHART, height=280,
-                         xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#1a2233"),
-                         showlegend=True)
+    fig_ev.add_hline(
+        y=fs["ev_score"].mean(), line_dash="dot", line_color=BLUE,
+        annotation_text=f"avg +{fs['ev_score'].mean():.2f}",
+        annotation_font_color=BLUE,
+    )
+    fig_ev.update_layout(
+        **CHART, height=280,
+        xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#1a2233"),
+        showlegend=True,
+    )
     st.plotly_chart(fig_ev, use_container_width=True)
 
     st.markdown('<div class="section-title">League performance table</div>', unsafe_allow_html=True)
     ls = fdf.groupby("league_name").agg(
-        total=("won","count"),
-        wins=("won","sum"),
-        draws=("lost","sum"),
-        avg_home=("home_odds","mean"),
-        avg_away=("away_odds","mean"),
-        avg_ev=("ev_score","mean"),
+        total=("won", "count"),
+        wins=("won", "sum"),
+        draws=("lost", "sum"),
+        avg_home=("home_odds", "mean"),
+        avg_away=("away_odds", "mean"),
+        avg_ev=("ev_score", "mean"),
     ).reset_index()
-    ls["win_rate%"] = (ls["wins"] / (ls["wins"] + ls["draws"]) * 100).round(1).fillna(0)
-    ls["avg_home"]  = ls["avg_home"].round(2)
-    ls["avg_away"]  = ls["avg_away"].round(2)
-    ls["avg_ev"]    = ls["avg_ev"].round(3)
-    ls = ls.rename(columns={"league_name":"League","total":"Total","wins":"Wins",
-                             "draws":"Draws","avg_home":"Avg Home","avg_away":"Avg Away","avg_ev":"Avg EV"})
+    # FIX 8: division by zero in win_rate
+    ls["win_rate%"] = (
+        ls.apply(
+            lambda r: round(r["wins"] / (r["wins"] + r["draws"]) * 100, 1)
+            if (r["wins"] + r["draws"]) > 0
+            else 0.0,
+            axis=1,
+        )
+    )
+    ls["avg_home"] = ls["avg_home"].round(2)
+    ls["avg_away"] = ls["avg_away"].round(2)
+    ls["avg_ev"]   = ls["avg_ev"].round(3)
+    ls = ls.rename(columns={
+        "league_name": "League", "total": "Total", "wins": "Wins",
+        "draws": "Draws", "avg_home": "Avg Home", "avg_away": "Avg Away", "avg_ev": "Avg EV",
+    })
     st.dataframe(ls, use_container_width=True, hide_index=True)
 
 # ══════════════════════════════════════════════════════════
@@ -740,14 +916,17 @@ with tab5:
                 </div>
                 """, unsafe_allow_html=True)
 
-    st.markdown('<div class="section-title" style="margin-top:8px">Bookmaker strategy guide</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-title" style="margin-top:8px">Bookmaker strategy guide</div>',
+        unsafe_allow_html=True,
+    )
     tips = [
-        ("🏆 Bet365",      BLUE,      "Best for Champions League & EPL. Competitive odds 48hrs before kickoff. Highest liquidity."),
-        ("⚡ 1xBet",       GREEN,     "Highest odds overall. Best for La Liga & Bundesliga. Check for early market releases."),
-        ("🎯 Pinnacle",    YELLOW,    "Sharpest lines, highest limits. Best for large stakes. No account restrictions."),
-        ("🌟 William Hill", GREEN2,   "Strong for Premier League. Good early odds 3-4 days before match."),
-        ("🔥 Bwin",        RED,       "Strong for European leagues. Often releases markets earliest — good for shifts."),
-        ("💫 Unibet",      "#aa88ff", "Good secondary source. Use to verify against primary bookmaker."),
+        ("🏆 Bet365",      BLUE,       "Best for Champions League & EPL. Competitive odds 48hrs before kickoff. Highest liquidity."),
+        ("⚡ 1xBet",       GREEN,      "Highest odds overall. Best for La Liga & Bundesliga. Check for early market releases."),
+        ("🎯 Pinnacle",    YELLOW,     "Sharpest lines, highest limits. Best for large stakes. No account restrictions."),
+        ("🌟 William Hill", GREEN2,    "Strong for Premier League. Good early odds 3-4 days before match."),
+        ("🔥 Bwin",        RED,        "Strong for European leagues. Often releases markets earliest — good for shifts."),
+        ("💫 Unibet",      "#aa88ff",  "Good secondary source. Use to verify against primary bookmaker."),
     ]
     for name, color, tip in tips:
         st.markdown(f"""
@@ -765,22 +944,31 @@ with tab6:
     st.markdown('<div class="section-title">Update match results</div>', unsafe_allow_html=True)
     st.markdown("After a match ends, update the result here to track accuracy and P&L.")
 
-    pend_df = fdf[fdf["pending"]].sort_values("commence_time").drop_duplicates(subset="match_id")
+    pend_df = (
+        fdf[fdf["pending"]]
+        .sort_values("commence_time")
+        .drop_duplicates(subset="match_id")
+    )
 
     if pend_df.empty:
         st.success("No pending matches!")
     else:
         st.markdown(f"**{len(pend_df)}** matches awaiting results")
 
-        for idx, (_, row) in enumerate(pend_df.head(30).iterrows()):
-            with st.expander(f"{row['home_team']} vs {row['away_team']} · {row['league_name']} · {row['spotted_at'].strftime('%b %d')}"):
-                uc1, uc2, uc3 = st.columns([2,1,1])
+        # FIX 2 + 10: All Tab 6 widget keys use t6_ prefix + loop index
+        for t6_idx, (_, row) in enumerate(pend_df.head(30).iterrows()):
+            with st.expander(
+                f"{row['home_team']} vs {row['away_team']} · "
+                f"{row['league_name']} · {row['spotted_at'].strftime('%b %d')}"
+            ):
+                uc1, uc2, uc3 = st.columns([2, 1, 1])
 
                 with uc1:
+                    # FIX 2: t6_ prefix on all keys in this tab
                     sel = st.selectbox(
                         "Result",
                         ["Select...", "home_win", "away_win", "draw"],
-                        key=f"res_{row['match_id']}_{idx}",
+                        key=f"t6_res_{row['match_id']}_{t6_idx}",
                     )
                 with uc2:
                     if sel == "home_win":
@@ -790,12 +978,13 @@ with tab6:
                         p = round(stake * row["away_odds"] - stake * 2)
                         st.metric("Profit", f"+${p:,}")
                     elif sel == "draw":
-                        st.metric("Loss", f"-${stake*2:,}")
+                        st.metric("Loss", f"-${stake * 2:,}")
                 with uc3:
+                    # FIX 2: t6_ prefix
                     placed_check = st.checkbox(
                         "Bet was placed",
-                        value=bool(row.get("bet_placed", False)),
-                        key=f"bp_{row['match_id']}_{idx}",
+                        value=bool(_row_get(row, "bet_placed", False)),
+                        key=f"t6_bp_{row['match_id']}_{t6_idx}",
                     )
 
                 if sel != "Select...":
@@ -803,7 +992,8 @@ with tab6:
                     elif sel == "away_win": ap = round(5000 * row["away_odds"] - 10000)
                     else:                   ap = -10000
 
-                    if st.button("💾 Save result", key=f"sv_{row['match_id']}_{idx}"):
+                    # FIX 2: t6_ prefix
+                    if st.button("💾 Save result", key=f"t6_sv_{row['match_id']}_{t6_idx}"):
                         ok = sb_patch("opportunities", row["match_id"], {
                             "result": sel,
                             "actual_profit": ap,
@@ -822,12 +1012,14 @@ with tab6:
 with tab7:
     st.markdown('<div class="section-title">P&L tracker</div>', unsafe_allow_html=True)
 
-    tc1, tc2, tc3, tc4 = st.columns(4)
-    tc1.metric("Stake per side", f"${stake:,}")
-    tc2.metric("Total invested (sim)", f"${stake*2*total:,}")
-    tc3.metric("Net P&L (sim)", f"${total_pl:,}")
-    roi = (total_pl / (stake*2*len(resolved))*100) if len(resolved) > 0 else 0
-    tc4.metric("ROI", f"{roi:.1f}%")
+    # FIX 6: t7_ prefix for all columns in this tab
+    t7_c1, t7_c2, t7_c3, t7_c4 = st.columns(4)
+    t7_c1.metric("Stake per side", f"${stake:,}")
+    t7_c2.metric("Total invested (sim)", f"${stake * 2 * total:,}")
+    t7_c3.metric("Net P&L (sim)", f"${total_pl:,}")
+    # FIX 8: division by zero in ROI
+    roi = (total_pl / (stake * 2 * len(resolved)) * 100) if len(resolved) > 0 else 0.0
+    t7_c4.metric("ROI", f"{roi:.1f}%")
 
     if not resolved.empty:
         r3 = resolved.sort_values("spotted_at").copy()
@@ -839,7 +1031,7 @@ with tab7:
         fig_pl.add_trace(go.Scatter(
             x=r3["spotted_at"], y=r3["cumpl"],
             fill="tozeroy", fillcolor="rgba(0,255,136,0.07)",
-            line=dict(color=GREEN, width=2.5), name="All opps"
+            line=dict(color=GREEN, width=2.5), name="All opps",
         ))
         if not placed.empty and not placed[~placed["pending"]].empty:
             pr = placed[~placed["pending"]].sort_values("spotted_at").copy()
@@ -847,45 +1039,73 @@ with tab7:
             pr["cumpl"] = pr["sim"].cumsum()
             fig_pl.add_trace(go.Scatter(
                 x=pr["spotted_at"], y=pr["cumpl"],
-                line=dict(color=YELLOW, width=2, dash="dot"), name="My bets only"
+                line=dict(color=YELLOW, width=2, dash="dot"), name="My bets only",
             ))
         fig_pl.add_hline(y=0, line_dash="dot", line_color="#243044")
-        fig_pl.update_layout(**CHART, height=300,
-                             yaxis=dict(gridcolor="#1a2233", tickprefix="$"),
-                             xaxis=dict(showgrid=False), legend=dict(bgcolor="#0d1117"))
+        fig_pl.update_layout(
+            **CHART, height=300,
+            yaxis=dict(gridcolor="#1a2233", tickprefix="$"),
+            xaxis=dict(showgrid=False),
+            legend=dict(bgcolor="#0d1117"),
+        )
         st.plotly_chart(fig_pl, use_container_width=True)
 
         st.markdown('<div class="section-title">Rolling win rate</div>', unsafe_allow_html=True)
         fig_wr = go.Figure()
         fig_wr.add_trace(go.Scatter(
             x=r3["spotted_at"], y=r3["wrrate"],
-            line=dict(color=YELLOW, width=2.5)
+            line=dict(color=YELLOW, width=2.5),
         ))
-        fig_wr.add_hline(y=80, line_dash="dot", line_color=GREEN,
-                         annotation_text="80% target", annotation_font_color=GREEN)
-        fig_wr.update_layout(**CHART, height=220,
-                             yaxis=dict(gridcolor="#1a2233", ticksuffix="%", range=[0,100]),
-                             xaxis=dict(showgrid=False), showlegend=False)
+        fig_wr.add_hline(
+            y=80, line_dash="dot", line_color=GREEN,
+            annotation_text="80% target", annotation_font_color=GREEN,
+        )
+        fig_wr.update_layout(
+            **CHART, height=220,
+            yaxis=dict(gridcolor="#1a2233", ticksuffix="%", range=[0, 100]),
+            xaxis=dict(showgrid=False), showlegend=False,
+        )
         st.plotly_chart(fig_wr, use_container_width=True)
 
         st.markdown('<div class="section-title">Per-bet log</div>', unsafe_allow_html=True)
-        log_df = r3[["spotted_at","home_team","away_team","league_name",
-                      "home_odds","away_odds","result","sim","cumpl"]].copy()
+        log_df = r3[[
+            "spotted_at", "home_team", "away_team", "league_name",
+            "home_odds", "away_odds", "result", "sim", "cumpl",
+        ]].copy()
         log_df["spotted_at"] = log_df["spotted_at"].dt.strftime("%b %d %H:%M")
         log_df["sim"]   = log_df["sim"].apply(lambda x: f"+${x:,.0f}" if x > 0 else f"-${abs(x):,.0f}")
         log_df["cumpl"] = log_df["cumpl"].apply(lambda x: f"${x:,.0f}")
-        log_df.columns  = ["Date","Home","Away","League","Home Odds","Away Odds","Result","Bet P&L","Running Total"]
+        log_df.columns  = [
+            "Date", "Home", "Away", "League",
+            "Home Odds", "Away Odds", "Result", "Bet P&L", "Running Total",
+        ]
         st.dataframe(log_df, use_container_width=True, height=350, hide_index=True)
     else:
         st.info("No resolved matches yet. Add results in the Update Results tab.")
 
-    st.markdown('<div class="section-title" style="margin-top:20px">What-if calculator</div>', unsafe_allow_html=True)
-    wc1, wc2, wc3 = st.columns(3)
-    with wc1:
-        wi_stake = st.slider("Stake per side ($)", 100, 50000, stake, 500)
-    with wc2:
-        wi_pl = int(resolved["actual_profit"].sum() * (wi_stake/5000)) if not resolved.empty else 0
+    st.markdown(
+        '<div class="section-title" style="margin-top:20px">What-if calculator</div>',
+        unsafe_allow_html=True,
+    )
+    t7_wc1, t7_wc2, t7_wc3 = st.columns(3)
+    with t7_wc1:
+        # FIX 3: Slider key conflict sidebar vs Tab 7 — explicit unique key "wi_stake_slider"
+        wi_stake = st.slider(
+            "Stake per side ($)", 100, 50_000, stake, 500,
+            key="wi_stake_slider",
+        )
+    with t7_wc2:
+        wi_pl = (
+            int(resolved["actual_profit"].sum() * (wi_stake / 5000))
+            if not resolved.empty
+            else 0
+        )
         st.metric(f"P&L with ${wi_stake:,} stake", f"${wi_pl:,}")
-    with wc3:
-        wi_roi = (wi_pl / (wi_stake*2*len(resolved))*100) if len(resolved) > 0 else 0
+    with t7_wc3:
+        # FIX 8: division by zero in wi_roi
+        wi_roi = (
+            (wi_pl / (wi_stake * 2 * len(resolved)) * 100)
+            if len(resolved) > 0
+            else 0.0
+        )
         st.metric("ROI", f"{wi_roi:.1f}%")
