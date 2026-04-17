@@ -78,34 +78,47 @@ def log_to_db(records: list):
     except Exception as e:
         log.error(f"  DB write failed: {e}")
 
-def log_opportunity(match: dict):
+def log_opportunity(match: dict) -> bool:
+    """Returns True if this is a NEW opportunity (not seen before)"""
     profit_home = round(STAKE_PER_SIDE * match["home_odds"] - STAKE_PER_SIDE * 2)
     profit_away = round(STAKE_PER_SIDE * match["away_odds"] - STAKE_PER_SIDE * 2)
     try:
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/opportunities",
+        # First check if this match_id already exists
+        check = requests.get(
+            f"{SUPABASE_URL}/rest/v1/opportunities?match_id=eq.{match['match_id']}&select=match_id",
             headers=supabase_headers(),
-            json={
-                "match_id":            match["match_id"],
-                "home_team":           match["home_team"],
-                "away_team":           match["away_team"],
-                "league":              match["league"],
-                "commence_time":       match["commence_time"],
-                "home_odds":           match["home_odds"],
-                "away_odds":           match["away_odds"],
-                "draw_odds":           match["draw_odds"],
-                "home_bookmaker":      match.get("home_bookmaker"),
-                "away_bookmaker":      match.get("away_bookmaker"),
-                "profit_if_home_wins": profit_home,
-                "profit_if_away_wins": profit_away,
-                "loss_if_draw":        -(STAKE_PER_SIDE * 2),
-                "spotted_at":          match["scanned_at"],
-            },
-            timeout=15,
+            timeout=10,
         )
-        log.info(f"  Opportunity logged ({r.status_code})")
+        already_exists = len(check.json()) > 0 if check.status_code == 200 else False
+
+        if not already_exists:
+            # New opportunity — insert it
+            requests.post(
+                f"{SUPABASE_URL}/rest/v1/opportunities",
+                headers=supabase_headers(),
+                json={
+                    "match_id":            match["match_id"],
+                    "home_team":           match["home_team"],
+                    "away_team":           match["away_team"],
+                    "league":              match["league"],
+                    "commence_time":       match["commence_time"],
+                    "home_odds":           match["home_odds"],
+                    "away_odds":           match["away_odds"],
+                    "draw_odds":           match["draw_odds"],
+                    "profit_if_home_wins": profit_home,
+                    "profit_if_away_wins": profit_away,
+                    "loss_if_draw":        -(STAKE_PER_SIDE * 2),
+                    "spotted_at":          match["scanned_at"],
+                },
+                timeout=15,
+            )
+            return True  # NEW — should be emailed
+        else:
+            return False  # Already seen — skip email
+
     except Exception as e:
         log.error(f"  Opportunity log failed: {e}")
+        return False
 
 # ============================================================
 #   ODDS FETCHING — The Odds API
@@ -364,10 +377,14 @@ def scan():
             seen.add(parsed["match_id"])
             all_records.append(parsed)
             if parsed["is_opportunity"]:
-                log.info(f"  OPPORTUNITY -> {parsed['home_team']} vs {parsed['away_team']} "
-                         f"({parsed['home_odds']}x / {parsed['away_odds']}x) [OddsAPI]")
-                opportunities.append(parsed)
-                log_opportunity(parsed)
+               log.info(f"  OPPORTUNITY -> {parsed['home_team']} vs {parsed['away_team']} "
+             f"({parsed['home_odds']}x / {parsed['away_odds']}x)")
+    is_new = log_opportunity(parsed)
+    if is_new:
+        opportunities.append(parsed)
+        log.info(f"    -> NEW opportunity, will email")
+    else:
+        log.info(f"    -> Already seen, skipping email")
 
         # 2. Fetch from Stake
         for raw in fetch_stake_odds(league):
